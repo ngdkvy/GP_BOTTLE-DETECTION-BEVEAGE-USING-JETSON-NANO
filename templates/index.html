@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hệ Thống Phát Hiện Lỗi Đóng Gói</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>HỆ THỐNG PHÁT HIỆN LỖI ĐÓNG GÓI CHAI NƯỚC (22161004 - 22161043)</h1>
+    <span id="status-badge" class="badge good">BÌNH THƯỜNG</span>
+  </header>
+
+  <main class="layout">
+    <!-- Cột trái: video cố định -->
+    <div class="video-col">
+      <section class="card stream-card">
+        <h2>📷 Camera Realtime</h2>
+        <img src="/video_feed" id="stream" alt="Video stream">
+      </section>
+    </div>
+
+    <!-- Cột phải: số liệu thống kê + lịch sử -->
+    <div class="stats-col">
+      <section class="stats-grid">
+        <div class="card stat-card">
+          <span class="stat-icon">📦</span>
+          <span class="stat-label">Tổng chai</span>
+          <span class="stat-value" id="stat-total">0</span>
+        </div>
+        <div class="card stat-card good-card">
+          <span class="stat-icon">✅</span>
+          <span class="stat-label">Bình thường</span>
+          <span class="stat-value" id="stat-good">0</span>
+        </div>
+        <div class="card stat-card defect-card">
+          <span class="stat-icon">❌</span>
+          <span class="stat-label">Lỗi phát hiện</span>
+          <span class="stat-value" id="stat-defect">0</span>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>📊 Thống Kê Theo Loại</h2>
+        <div id="counts-grid" class="counts-grid"></div>
+      </section>
+
+      <section class="card">
+        <h2>🕒 Lịch Sử Phát Hiện Lỗi</h2>
+        <table id="history-table">
+          <thead>
+            <tr><th>Thời gian</th><th>Loại lỗi</th><th>Độ tin cậy</th></tr>
+          </thead>
+          <tbody id="history-body"></tbody>
+        </table>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    async function fetchStats() {
+      const res  = await fetch("/api/stats");
+      const data = await res.json();
+
+      // Cập nhật thống kê
+      document.getElementById("stat-total").textContent  = data.total;
+      document.getElementById("stat-good").textContent   = data.good;
+      document.getElementById("stat-defect").textContent = data.defect;
+
+      // Badge trạng thái
+      const badge = document.getElementById("status-badge");
+      if (data.defect > 0 && data.defect === data.total) {
+        badge.className = "badge defect";
+        badge.textContent = "⚠️ PHÁT HIỆN LỖI";
+      } else {
+        badge.className = "badge good";
+        badge.textContent = "✅ BÌNH THƯỜNG";
+      }
+
+      // Thống kê theo loại
+      const countsGrid = document.getElementById("counts-grid");
+      countsGrid.innerHTML = "";
+      for (const [label, count] of Object.entries(data.counts)) {
+        countsGrid.innerHTML += `
+          <div class="count-item">
+            <span class="count-label">${label}</span>
+            <span class="count-value">${count}</span>
+          </div>`;
+      }
+
+      // Lịch sử
+      const tbody = document.getElementById("history-body");
+      tbody.innerHTML = "";
+      for (const item of data.history) {
+        tbody.innerHTML += `
+          <tr>
+            <td>${item.time}</td>
+            <td>${item.labels.join(", ")}</td>
+            <td>${(item.score * 100).toFixed(1)}%</td>
+          </tr>`;
+      }
+    }
+
+    // Cập nhật mỗi 1 giây
+    setInterval(fetchStats, 1000);
+    fetchStats();
+  </script>
+</body>
+</html>
