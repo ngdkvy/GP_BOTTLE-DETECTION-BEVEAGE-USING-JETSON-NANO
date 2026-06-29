@@ -5,6 +5,26 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Hệ Thống Phát Hiện Lỗi Đóng Gói</title>
   <link rel="stylesheet" href="/static/style.css">
+  <style>
+    /* Ép 4 nhãn hiển thị trên cùng 1 hàng duy nhất và chia đều 100% độ rộng */
+    .counts-row-equal {
+      display: flex;
+      flex-direction: row;
+      gap: 12px;
+      width: 100%;
+    }
+    .counts-row-equal .count-item {
+      flex: 1; /* Chia đều độ rộng bằng nhau (mỗi ô chiếm 25%) */
+      background: #0f172a;
+      border-radius: 8px;
+      padding: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border: 1px solid #334155;
+      min-width: 0; /* Tránh vỡ khung chữ trên màn hình nhỏ */
+    }
+  </style>
 </head>
 <body>
   <header>
@@ -13,7 +33,6 @@
   </header>
 
   <main class="layout">
-    <!-- Cột trái: video cố định -->
     <div class="video-col">
       <section class="card stream-card">
         <h2>📷 Camera Realtime</h2>
@@ -21,7 +40,6 @@
       </section>
     </div>
 
-    <!-- Cột phải: số liệu thống kê + lịch sử -->
     <div class="stats-col">
       <section class="stats-grid">
         <div class="card stat-card">
@@ -43,14 +61,19 @@
 
       <section class="card">
         <h2>📊 Thống Kê Theo Loại</h2>
-        <div id="counts-grid" class="counts-grid"></div>
+        <div class="counts-row-equal">
+          <div class="count-item"><span class="count-label">QUALIFIELD</span><span class="count-value" id="lbl-qualifield">0</span></div>
+          <div class="count-item"><span class="count-label">MISSING LABEL</span><span class="count-value" id="lbl-missing-label">0</span></div>
+          <div class="count-item"><span class="count-label">WRONG LABEL</span><span class="count-value" id="lbl-wrong-label">0</span></div>
+          <div class="count-item"><span class="count-label">NO CAP</span><span class="count-value" id="lbl-no-cap">0</span></div>
+        </div>
       </section>
 
       <section class="card">
-        <h2>🕒 Lịch Sử Phát Hiện Lỗi</h2>
+        <h2>🕒 Lịch Sử Phát Hiện</h2>
         <table id="history-table">
           <thead>
-            <tr><th>Thời gian</th><th>Loại lỗi</th><th>Độ tin cậy</th></tr>
+            <tr><th>Thời gian</th><th>Loại sản phẩm / Lỗi</th><th>Độ tin cậy</th></tr>
           </thead>
           <tbody id="history-body"></tbody>
         </table>
@@ -60,50 +83,47 @@
 
   <script>
     async function fetchStats() {
-      const res  = await fetch("/api/stats");
-      const data = await res.json();
+      try {
+        const res  = await fetch("/api/stats");
+        const data = await res.json();
 
-      // Cập nhật thống kê
-      document.getElementById("stat-total").textContent  = data.total;
-      document.getElementById("stat-good").textContent   = data.good;
-      document.getElementById("stat-defect").textContent = data.defect;
+        document.getElementById("stat-total").textContent  = data.total;
+        document.getElementById("stat-good").textContent   = data.good;
+        document.getElementById("stat-defect").textContent = data.defect;
 
-      // Badge trạng thái
-      const badge = document.getElementById("status-badge");
-      if (data.defect > 0 && data.defect === data.total) {
-        badge.className = "badge defect";
-        badge.textContent = "⚠️ PHÁT HIỆN LỖI";
-      } else {
-        badge.className = "badge good";
-        badge.textContent = "✅ BÌNH THƯỜNG";
-      }
+        // Cập nhật giá trị 4 ô nhãn nằm ngang
+        document.getElementById("lbl-qualifield").textContent   = data.counts["QUALIFIELD"] || 0;
+        document.getElementById("lbl-missing-label").textContent = data.counts["MISSING LABEL"] || 0;
+        document.getElementById("lbl-wrong-label").textContent   = data.counts["WRONG LABEL"] || 0;
+        document.getElementById("lbl-no-cap").textContent        = data.counts["NO CAP"] || 0;
 
-      // Thống kê theo loại
-      const countsGrid = document.getElementById("counts-grid");
-      countsGrid.innerHTML = "";
-      for (const [label, count] of Object.entries(data.counts)) {
-        countsGrid.innerHTML += `
-          <div class="count-item">
-            <span class="count-label">${label}</span>
-            <span class="count-value">${count}</span>
-          </div>`;
-      }
+        // Badge trạng thái thời gian thực
+        const badge = document.getElementById("status-badge");
+        if (data.defect > 0) {
+          badge.className = "badge defect";
+          badge.textContent = "⚠️ PHÁT HIỆN LỖI";
+        } else {
+          badge.className = "badge good";
+          badge.textContent = "✅ BÌNH THƯỜNG";
+        }
 
-      // Lịch sử
-      const tbody = document.getElementById("history-body");
-      tbody.innerHTML = "";
-      for (const item of data.history) {
-        tbody.innerHTML += `
-          <tr>
-            <td>${item.time}</td>
-            <td>${item.labels.join(", ")}</td>
-            <td>${(item.score * 100).toFixed(1)}%</td>
-          </tr>`;
-      }
+        // Cập nhật bảng lịch sử phát hiện tức thì
+        const tbody = document.getElementById("history-body");
+        tbody.innerHTML = "";
+        for (const item of data.history) {
+          let rowStyle = item.labels[0] === "QUALIFIELD" ? "style='color: #4ade80; font-weight: bold;'" : "style='color: #f87171;'";
+          tbody.innerHTML += `
+            <tr ${rowStyle}>
+              <td>${item.time}</td>
+              <td>${item.labels.join(", ")}</td>
+              <td>${(item.score * 100).toFixed(1)}%</td>
+            </tr>`;
+        }
+      } catch (e) { console.error("Error: ", e); }
     }
 
-    // Cập nhật mỗi 1 giây
-    setInterval(fetchStats, 1000);
+    // Tần suất quét dữ liệu nhanh (500ms) đảm bảo nhảy số song song với camera
+    setInterval(fetchStats, 500);
     fetchStats();
   </script>
 </body>
