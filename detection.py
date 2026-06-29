@@ -4,51 +4,65 @@ import cv2
 import numpy as np
 import time
 import threading
+import socket
 from datetime import datetime
-from flask import Flask, Response, render_template, jsonify
+from flask import Flask, Response, render_template, jsonify, request
+from werkzeug.serving import WSGIRequestHandler
 from collections import deque
 import argparse
 import os
 import sys
 
+
+class QuietRequestHandler(WSGIRequestHandler):
+    """
+    FIX: Chi tat log IN RA CHO MOI REQUEST (vd GET /api/stats moi giay,
+    GET /video_feed lien tuc...). KHONG dong toi logger 'werkzeug' noi
+    chung, nho vay dong banner khoi dong cua Flask
+    (" * Running on http://<lan-ip>:port") van hien thi binh thuong.
+    """
+    def log_request(self, code="-", size="-"):
+        pass
+
+
+def get_lan_ip():
+    """Do IP LAN thuc te cua Jetson (khong phai 127.0.0.1)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
 # --- ARGUMENT PARSER ---
 parser = argparse.ArgumentParser(description="Water Bottle Defect Detection")
-parser.add_argument(
-    "--device", type=str, default="gpu", choices=["gpu", "cpu"],
-    help="Device: gpu=TensorRT, cpu=OpenCV DNN"
-)
 parser.add_argument(
     "--port", type=int, default=5000,
     help="Flask server port (default: 5000)"
 )
 args, _ = parser.parse_known_args()
 
-USE_GPU = (args.device == "gpu")
-print("[INFO] Mode: %s" % ("GPU (TensorRT)" if USE_GPU else "CPU (OpenCV DNN)"))
+print("[INFO] Mode: GPU (TensorRT)")
 
-# --- Import conditional ---
-if USE_GPU:
-    try:
-        import tensorrt as trt
-        import pycuda.driver as cuda
-        # FIX 1: Chi goi cuda.init() mot lan duy nhat o day
-        # KHONG tao context o day - se tao trong inference thread
-        cuda.init()
-        print("[INFO] PyCUDA initialized OK")
-    except ImportError as e:
-        print("[ERROR] TensorRT/PyCUDA not found: %s" % str(e))
-        print("[INFO] Falling back to CPU mode")
-        USE_GPU = False
+# Luon dung GPU/TensorRT, khong con lua chon CPU nua.
+import tensorrt as trt
+import pycuda.driver as cuda
+# FIX 1: Chi goi cuda.init() mot lan duy nhat o day
+# KHONG tao context o day - se tao trong inference thread
+cuda.init()
+print("[INFO] PyCUDA initialized OK")
 
 app = Flask(__name__)
 
 # --- CONFIG ---
 ENGINE_PATH  = "best.engine"
-ONNX_PATH    = "best.onnx"
 LABELS_PATH  = "labels.txt"
 INPUT_SIZE   = (448, 448)
 
-NUM_CLASSES     = 5
+NUM_CLASSES     = 4
 OUTPUT_CHANNELS = 4 + NUM_CLASSES   # 9
 OUTPUT_ANCHORS  = 4116
 OUTPUT_SHAPE    = (1, OUTPUT_CHANNELS, OUTPUT_ANCHORS)
@@ -58,24 +72,33 @@ IOU_THRESH   = 0.45
 CAMERA_INDEX = 0
 MAX_HISTORY  = 50
 
-# Nhan duoc tinh la "binh thuong" (khong loi) - so khop khong phan biet hoa/thuong
+# Nhan duoc coi la "Binh thuong" (cot Tong/Binh thuong/Phat hien loi
+# tren web dua vao day). Cac nhan KHAC nhan nay deu tinh la loi.
 GOOD_LABEL = "QUALIFIELD"
-
-
-def is_good_label(label_name):
-    return label_name.strip().upper() == GOOD_LABEL.strip().upper()
-
 
 # Doc labels
 if not os.path.exists(LABELS_PATH):
     print("[WARNING] labels.txt not found, using default labels")
-    LABELS = ["NO CAP", "NO LABEL", "QUALIFIELD", "WRONG CAP", "WRONG LABEL"]
+    LABELS = ["good", "no_cap", "wrong_cap", "no_label", "wrong_label"]
 else:
     with open(LABELS_PATH) as f:
         LABELS = [line.strip() for line in f.readlines()]
 
-COLORS = np.random.randint(0, 255, size=(len(LABELS), 3), dtype=np.uint8)
-
+# Mau BGR co dinh cho tung loai nhan (thay cho mau random truoc day)
+# Luu y: cv2 dung thu tu BGR, khong phai RGB.
+COLOR_MAP = {
+    "QUALIFIELD":    [0, 255, 0],     # Xanh la
+    "MISSING LABEL": [0, 0, 255],     # Do
+    "WRONG LABEL":     [0, 165, 255],   # Cam
+    "NO CAP":        [0, 255, 255],   # Vang
+}
+COLORS = np.array(
+    [COLOR_MAP.get(l, [255, 255, 255]) for l in LABELS],  # trang neu thieu mapping
+    dtype=np.uint8,
+)
+for _l in LABELS:
+    if _l not in COLOR_MAP:
+        print("[WARNING] Nhan '%s' khong co trong COLOR_MAP, dung mau trang mac dinh" % _l)
 
 # --- GLOBAL VARIABLES ---
 lock         = threading.Lock()
@@ -85,7 +108,7 @@ stats = {
     "good":   0,
     "defect": 0,
     "fps":    0.0,
-    "device": "GPU" if USE_GPU else "CPU",
+    "device": "GPU",
     "counts": {label: 0 for label in LABELS},
 }
 history     = deque(maxlen=MAX_HISTORY)
@@ -124,13 +147,11 @@ class KalmanBoxTracker(object):
         self.class_id          = 0
         self.score             = 0.0
         self.class_history     = []  # [(class_id, score), ...] trong suot doi track
-        self.last_seen         = time.time()  # moc thoi gian lan cuoi co detection khop
 
     def record(self, class_id, score):
         """Ghi nhan lop du doan moi nhat cho track nay (dung de bo phieu sau)."""
-        self.class_id  = class_id
-        self.score     = score
-        self.last_seen = time.time()
+        self.class_id = class_id
+        self.score    = score
         self.class_history.append((class_id, score))
 
     @staticmethod
@@ -180,9 +201,9 @@ def iou_batch(bb_test, bb_gt):
 
 
 class ByteTracker(object):
-    def __init__(self, max_age_seconds=0.5, min_hits=3,
+    def __init__(self, max_age=30, min_hits=3,
                  iou_thresh=0.3, high_thresh=0.6, low_thresh=0.1):
-        self.max_age_seconds = max_age_seconds
+        self.max_age     = max_age
         self.min_hits    = min_hits
         self.iou_thresh  = iou_thresh
         self.high_thresh = high_thresh
@@ -269,9 +290,8 @@ class ByteTracker(object):
             self.trackers.append(trk)
 
         alive, finished = [], []
-        now = time.time()
         for t in self.trackers:
-            if (now - t.last_seen) <= self.max_age_seconds:
+            if t.time_since_update <= self.max_age:
                 alive.append(t)
             else:
                 finished.append(t)
@@ -345,63 +365,36 @@ def postprocess_raw(raw, orig_shape):
 #  GPU PATH (TensorRT)
 # ================================================================
 
-if USE_GPU:
-    TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
-
-    def load_engine(path):
-        with open(path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
-            return runtime.deserialize_cuda_engine(f.read())
-
-    def allocate_buffers(engine):
-        inputs, outputs, bindings = [], [], []
-        stream = cuda.Stream()
-        for binding in engine:
-            size     = trt.volume(engine.get_binding_shape(binding))
-            dtype    = trt.nptype(engine.get_binding_dtype(binding))
-            host_mem = cuda.pagelocked_empty(size, dtype)
-            dev_mem  = cuda.mem_alloc(host_mem.nbytes)
-            bindings.append(int(dev_mem))
-            if engine.binding_is_input(binding):
-                inputs.append({"host": host_mem, "device": dev_mem})
-            else:
-                outputs.append({"host": host_mem, "device": dev_mem})
-        return inputs, outputs, bindings, stream
-
-
 # ================================================================
-#  CPU PATH (OpenCV DNN + ONNX)
+#  GPU PATH (TensorRT)
 # ================================================================
 
-def load_onnx_net(path):
-    """
-    FIX 2: Kiem tra file ONNX truoc khi load.
-    Neu bi loi 'raw_data empty', can export lai tu best.pt bang lenh:
-        python3 -c "from ultralytics import YOLO; YOLO('best.pt').export(format='onnx', opset=12, simplify=True)"
-    Hoac tren Colab:
-        !yolo export model=best.pt format=onnx opset=12 simplify=True
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError("[ERROR] ONNX file not found: %s" % path)
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
-    file_size = os.path.getsize(path)
-    print("[INFO] ONNX file size: %.1f MB" % (file_size / 1024.0 / 1024.0))
-    if file_size < 1024 * 10:  # nho hon 10KB => co the bi loi
-        raise ValueError(
-            "[ERROR] ONNX file too small (%d bytes). "
-            "Please re-export with: "
-            "yolo export model=best.pt format=onnx opset=12 simplify=True" % file_size
-        )
+def load_engine(path):
+    with open(path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
+        return runtime.deserialize_cuda_engine(f.read())
 
-    net = cv2.dnn.readNetFromONNX(path)
-    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-    print("[INFO] ONNX model loaded OK: %s" % path)
-    return net
+def allocate_buffers(engine):
+    inputs, outputs, bindings = [], [], []
+    stream = cuda.Stream()
+    for binding in engine:
+        size     = trt.volume(engine.get_binding_shape(binding))
+        dtype    = trt.nptype(engine.get_binding_dtype(binding))
+        host_mem = cuda.pagelocked_empty(size, dtype)
+        dev_mem  = cuda.mem_alloc(host_mem.nbytes)
+        bindings.append(int(dev_mem))
+        if engine.binding_is_input(binding):
+            inputs.append({"host": host_mem, "device": dev_mem})
+        else:
+            outputs.append({"host": host_mem, "device": dev_mem})
+    return inputs, outputs, bindings, stream
 
 
 # ================================================================
 #  DRAW + UPDATE STATS
 # ================================================================
+
 
 def draw_and_update(frame, tracked_objects, finalized_objects):
     """
@@ -424,15 +417,21 @@ def draw_and_update(frame, tracked_objects, finalized_objects):
         label_name = LABELS[class_id]
         stats["total"] += 1
         stats["counts"][label_name] += 1
-        if is_good_label(label_name):
-            stats["good"] += 1
-        else:
+        # FIX: nhan thuc te la "QUALIFIELD", khong phai "good", nen phai
+        # so sanh voi GOOD_LABEL. Truoc day so sanh voi "good" -> luon
+        # sai (moi nhan deu bi tinh la loi, ke ca QUALIFIELD).
+        if label_name != GOOD_LABEL:
             stats["defect"] += 1
-            history.appendleft({
-                "time":   datetime.now().strftime("%H:%M:%S"),
-                "labels": [label_name],
-                "score":  round(score, 2),
-            })
+        else:
+            stats["good"] += 1
+
+        # FIX: ghi lich su cho TAT CA nhan (ke ca QUALIFIELD), khong
+        # chi rieng loi nhu truoc day.
+        history.appendleft({
+            "time":   datetime.now().strftime("%H:%M:%S"),
+            "labels": [label_name],
+            "score":  round(score, 2),
+        })
 
     return frame
 
@@ -465,15 +464,17 @@ def _update_fps(t0):
 
 def inference_loop():
     tracker = ByteTracker(
-        max_age_seconds=0.5, min_hits=3,
+        # FIX: max_age giam tu 30 -> 1 de chot ket qua NGAY khi chai
+        # roi khoi khung hinh (khong phai cho ~1s nhu truoc).
+        # Danh doi: neu chai bi che khuat tam thoi (occlusion) giua
+        # khung hinh, co the bi tinh la "da ra khung" roi tao track moi
+        # khi xuat hien lai -> nguy co dem trung 1 chai thanh 2 lan.
+        max_age=1, min_hits=3,
         iou_thresh=0.3,
         high_thresh=CONF_THRESH,
         low_thresh=0.1,
     )
-    if USE_GPU:
-        _gpu_loop(tracker)
-    else:
-        _cpu_loop(tracker)
+    _gpu_loop(tracker)
 
 
 def _gpu_loop(tracker):
@@ -551,47 +552,6 @@ def _gpu_loop(tracker):
                 print("[WARNING] Could not pop CUDA context: %s" % str(ex))
 
 
-def _cpu_loop(tracker):
-    global output_frame
-
-    print("[INFO] Loading ONNX model for CPU inference...")
-    try:
-        net = load_onnx_net(ONNX_PATH)
-    except Exception as e:
-        print(str(e))
-        print("\n[HINT] Re-export your model with one of these commands:")
-        print("  On Colab:  !yolo export model=best.pt format=onnx opset=12 simplify=True")
-        print("  On Jetson: python3 -c \"from ultralytics import YOLO; YOLO('best.pt').export(format='onnx', opset=12, simplify=True)\"")
-        return
-
-    cap = _open_camera()
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.01)
-            continue
-
-        t0   = time.time()
-        blob = cv2.dnn.blobFromImage(
-            frame, scalefactor=1.0/255.0,
-            size=INPUT_SIZE, swapRB=True, crop=False
-        )
-        net.setInput(blob)
-        t_infer = time.time()
-        raw     = net.forward()
-        infer_ms = (time.time() - t_infer) * 1000.0
-        print("[CPU] Infer: %.1f ms  |  FPS: %.1f" % (infer_ms, 1000.0 / max(infer_ms, 1.0)))
-
-        raw_dets = postprocess_raw(raw, frame.shape)
-        tracked, finalized = tracker.update(raw_dets)
-        frame    = draw_and_update(frame, tracked, finalized)
-        _update_fps(t0)
-
-        with lock:
-            output_frame = frame.copy()
-
-
 # ================================================================
 #  FLASK
 # ================================================================
@@ -616,7 +576,23 @@ def generate_stream():
 
 @app.route("/")
 def index():
-    return render_template("index.html", labels=LABELS)
+    # FIX: lay IP client va thoi gian server NGAY luc render trang.
+    # render_template chay lai moi khi trang duoc mo/tai lai (F5)
+    # -> thong bao chi hien 1 lan/lan tai trang, khong lap lai theo
+    # interval fetchStats (vi day khong qua AJAX, ma nhung san vao HTML).
+    client_ip   = request.remote_addr
+    server_time = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
+
+    # In DUNG 1 dong ra terminal moi khi co nguoi truy cap/F5 trang chu
+    # (log Werkzeug da bi tat o tren nen khong bi spam theo tung request).
+    print("[ACCESS] %s - %s" % (client_ip, server_time))
+
+    return render_template(
+        "index.html",
+        labels=LABELS,
+        client_ip=client_ip,
+        server_time=server_time,
+    )
 
 @app.route("/video_feed")
 def video_feed():
@@ -648,13 +624,15 @@ if __name__ == "__main__":
     # FIX 3: Flask chi chay HTTP thuan tuy (port 5000)
     # Truy cap bang: http://<jetson-ip>:5000  (KHONG dung https://)
     # Neu browser tu dong chuyen sang https, dung: http://192.168.1.x:5000
+    lan_ip = get_lan_ip()
     print("[INFO] Flask server starting on http://0.0.0.0:%d" % args.port)
-    print("[INFO] Access from browser: http://<jetson-ip>:%d" % args.port)
+    print("[INFO] Access from browser: http://%s:%d" % (lan_ip, args.port))
     print("[INFO] NOTE: Use HTTP (not HTTPS) in your browser!")
     app.run(
         host="0.0.0.0",
         port=args.port,
         threaded=True,
         use_reloader=False,   # Quan trong: tat reloader tranh tao 2 inference thread
-        debug=False           # tat debug mode tranh fork process
+        debug=False,          # tat debug mode tranh fork process
+        request_handler=QuietRequestHandler,  # FIX: tat log spam tung request
     )
